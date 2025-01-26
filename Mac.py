@@ -7,7 +7,6 @@ import random
 import argparse
 import json
 import os
-import time
 import platform
 import ctypes
 import requests
@@ -26,6 +25,7 @@ class NetworkConfigurator:
         """Get detailed information about a network interface."""
         try:
             if self.os_type == 'windows':
+                # Get IP configuration
                 output = subprocess.check_output(['ipconfig', '/all']).decode()
                 interface_section = None
                 for section in output.split('\n\n'):
@@ -35,6 +35,7 @@ class NetworkConfigurator:
                 if interface_section:
                     return self._parse_windows_interface_info(interface_section)
             else:
+                # Use ip addr show for Linux
                 output = subprocess.check_output(['ip', 'addr', 'show', interface]).decode()
                 return self._parse_linux_interface_info(output)
         except subprocess.CalledProcessError:
@@ -89,6 +90,7 @@ class NetworkConfigurator:
         ipv4_match = re.search(r'inet (\d+\.\d+\.\d+\.\d+)/(\d+)', info)
         if ipv4_match:
             result['ip_address'] = ipv4_match.group(1)
+            # Convert CIDR to netmask
             result['netmask'] = str(ipaddress.IPv4Network(f'0.0.0.0/{ipv4_match.group(2)}', strict=False).netmask)
         
         # Extract IPv6 information
@@ -118,58 +120,64 @@ class NetworkConfigurator:
         
         return result
 
-    def randomize_all(self, interface):
-        """Randomize all interface settings."""
+    def set_ip_address(self, interface, ip_address, netmask=None, gateway=None):
+        """Set IP address for an interface."""
         try:
-            # First bring down the interface
+            if not self._validate_ip_address(ip_address):
+                return False, "Invalid IP address format"
+            
             if self.os_type == 'windows':
-                subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=disable'])
+                # Windows IP configuration
+                cmd = ['netsh', 'interface', 'ip', 'set', 'address', 
+                      interface, 'static', ip_address]
+                if netmask:
+                    cmd.append(netmask)
+                if gateway:
+                    cmd.append(gateway)
             else:
-                subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'down'])
-
-            # Generate random settings
-            ip = f"192.168.{random.randint(1, 254)}.{random.randint(1, 254)}"
-            netmask = "255.255.255.0"
-            mtu = random.randint(1200, 1500)  # Safe MTU range
-
-            try:
-                if self.os_type == 'windows':
-                    # Set IP and netmask
-                    subprocess.check_output(['netsh', 'interface', 'ip', 'set', 'address', 
-                                          'name=' + interface, 'static', ip, netmask], stderr=subprocess.PIPE)
-                    # Set MTU
-                    subprocess.check_output(['netsh', 'interface', 'ipv4', 'set', 'subinterface', 
-                                          interface, f'mtu={mtu}', 'store=persistent'], stderr=subprocess.PIPE)
+                # Linux IP configuration
+                if netmask:
+                    # Convert netmask to CIDR notation
+                    cidr = self._netmask_to_cidr(netmask)
+                    ip_with_cidr = f"{ip_address}/{cidr}"
                 else:
-                    # Set IP and netmask
-                    subprocess.check_output(['ip', 'addr', 'flush', 'dev', interface], stderr=subprocess.PIPE)
-                    subprocess.check_output(['ip', 'addr', 'add', f"{ip}/24", 'dev', interface], stderr=subprocess.PIPE)
-                    # Set MTU
-                    subprocess.check_output(['ip', 'link', 'set', interface, 'mtu', str(mtu)], stderr=subprocess.PIPE)
-
-            except subprocess.CalledProcessError as e:
-                print(f"{Fore.RED}Error configuring network settings: {e.stderr.decode() if e.stderr else str(e)}{Style.RESET_ALL}")
-                return False, "Failed to configure network settings"
-
-            # Bring the interface back up
-            if self.os_type == 'windows':
-                subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=enable'])
-            else:
-                subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'up'])
-
-            # Wait for interface to stabilize
-            print(f"{Fore.YELLOW}Waiting for interface to stabilize...{Style.RESET_ALL}")
-            import time
-            time.sleep(5)
-
-            return True, f"IP: {ip}, Netmask: {netmask}, MTU: {mtu}"
+                    ip_with_cidr = f"{ip_address}/24"  # Default to /24 if no netmask
+                
+                cmd = ['ip', 'addr', 'add', ip_with_cidr, 'dev', interface]
+            
+            subprocess.check_output(cmd)
+            return True, "IP address set successfully"
         except subprocess.CalledProcessError as e:
-            error_msg = e.stderr.decode() if hasattr(e, 'stderr') and e.stderr else str(e)
-            print(f"{Fore.RED}Error: {error_msg}{Style.RESET_ALL}")
-            return False, str(e)
-        except Exception as e:
-            print(f"{Fore.RED}Unexpected error: {str(e)}{Style.RESET_ALL}")
-            return False, str(e)
+            return False, f"Error setting IP address: {str(e)}"
+
+    def set_mtu(self, interface, mtu):
+        """Set MTU for an interface."""
+        try:
+            if not isinstance(mtu, int) or mtu < 68 or mtu > 65535:
+                return False, "Invalid MTU value (must be between 68 and 65535)"
+            
+            if self.os_type == 'windows':
+                cmd = ['netsh', 'interface', 'ipv4', 'set', 'subinterface', 
+                      interface, f'mtu={mtu}', 'store=persistent']
+            else:
+                cmd = ['ip', 'link', 'set', interface, 'mtu', str(mtu)]
+            
+            subprocess.check_output(cmd)
+            return True, "MTU set successfully"
+        except subprocess.CalledProcessError as e:
+            return False, f"Error setting MTU: {str(e)}"
+
+    def _validate_ip_address(self, ip):
+        """Validate IP address format."""
+        try:
+            ipaddress.ip_address(ip)
+            return True
+        except ValueError:
+            return False
+
+    def _netmask_to_cidr(self, netmask):
+        """Convert subnet mask to CIDR notation."""
+        return sum([bin(int(x)).count('1') for x in netmask.split('.')])
 
 class MACChanger:
     def __init__(self):
@@ -178,46 +186,71 @@ class MACChanger:
         self.config_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
         self.network_config = NetworkConfigurator(self.os_type)
         self.load_config()
-        
-        # Print the banner
-        banner = r"""  ____ _              _____   _          _      ____            
- / ___| |__   ___  __|_   _| | |   _   _| |____/ ___|  ___  ___ 
-| |  _| '_ \ / _ \/ __|| |   | |  | | | | |_  /\___ \ / _ \/ __|
-| |_| | | | | (_) \__ \| |   | |__| |_| | |/ /  ___) |  __/ (__ 
- \____|_| |_|\___/|___/|_|   |_____\__,_|_/___||____/ \___|\___|
-
-                                                                 """
-        print(f"{Fore.RED}{banner}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}╔══════════════════════════════════════╗{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}║          Ghost MAC Tool             ║{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}║      Network Configuration Tool      ║{Style.RESET_ALL}")
         print(f"{Fore.CYAN}╚══════════════════════════════════════╝{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}Coded By Ghost LulzSec{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Telegram: @WW6WW6WW6{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}GitHub: https://github.com/6d69{Style.RESET_ALL}")
-        print(f"{Fore.RED}All rights reserved.{Style.RESET_ALL}")
 
     def load_config(self):
+        """Load configuration from file."""
         if os.path.exists(self.config_file):
             with open(self.config_file, 'r') as f:
                 self.config = json.load(f)
         else:
-            self.config = {'favorite_macs': {}}
+            self.config = {
+                'favorite_macs': {},
+                'excluded_vendors': []
+            }
             self.save_config()
 
     def save_config(self):
+        """Save configuration to file."""
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=4)
 
     def _get_random_mac(self):
+        """Generate a random MAC address."""
         first = random.randint(0, 15) * 2 + 2
         mac = [first] + [random.randint(0, 255) for _ in range(5)]
         return ':'.join([f"{b:02x}" for b in mac])
 
     def _validate_mac(self, mac_address):
+        """Validate MAC address format."""
         pattern = re.compile(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$')
         return bool(pattern.match(mac_address))
 
+    def _get_adapter_registry_path(self, interface):
+        """Get the registry path for a network adapter on Windows."""
+        try:
+            # Get network adapters from registry
+            cmd = 'reg query "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}" /s /v "NetCfgInstanceId"'
+            output = subprocess.check_output(cmd, shell=True).decode()
+            
+            # Get adapter information using netsh
+            netsh_cmd = 'netsh interface show interface'
+            netsh_output = subprocess.check_output(netsh_cmd, shell=True).decode()
+            
+            # Parse registry output
+            paths = []
+            current_path = None
+            for line in output.split('\n'):
+                if 'HKEY_LOCAL_MACHINE' in line:
+                    current_path = line.strip()
+                elif 'NetCfgInstanceId' in line and current_path:
+                    guid = line.split()[-1]
+                    paths.append((current_path, guid))
+            
+            # Match interface name with registry path
+            for path, guid in paths:
+                # Check if this adapter matches our interface
+                if interface.lower() in netsh_output.lower() and guid in netsh_output:
+                    return path
+                    
+            return None
+        except subprocess.CalledProcessError:
+            return None
+
     def _get_current_mac(self, interface):
+        """Get the current MAC address of the interface."""
         try:
             if self.os_type == 'windows':
                 output = subprocess.check_output(['getmac', '/v', '/fo', 'csv']).decode()
@@ -232,45 +265,13 @@ class MACChanger:
         except subprocess.CalledProcessError:
             return None
 
-    def _get_permanent_mac(self, interface):
-        """Get the permanent/burned-in MAC address."""
-        try:
-            if self.os_type == 'windows':
-                output = subprocess.check_output(['getmac', '/v', '/fo', 'csv']).decode()
-                for line in output.split('\n'):
-                    if interface.lower() in line.lower():
-                        # Look for the transport name which often contains the permanent MAC
-                        transport = line.split(',')[-1].strip('"')
-                        if transport:
-                            mac_match = re.search(r'([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})', transport)
-                            if mac_match:
-                                return mac_match.group(0)
-            else:
-                # Try ethtool first
-                try:
-                    output = subprocess.check_output(['ethtool', '-P', interface]).decode()
-                    mac_match = re.search(r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}', output)
-                    if mac_match:
-                        return mac_match.group(0)
-                except:
-                    pass
-                
-                # Try reading from sysfs as fallback
-                try:
-                    with open(f'/sys/class/net/{interface}/address', 'r') as f:
-                        return f.read().strip()
-                except:
-                    pass
-        except:
-            pass
-        return None
-
     def _list_interfaces(self):
+        """List all network interfaces."""
         try:
             if self.os_type == 'windows':
                 output = subprocess.check_output(['netsh', 'interface', 'show', 'interface']).decode()
                 interfaces = []
-                for line in output.split('\n')[3:]:
+                for line in output.split('\n')[3:]:  # Skip header lines
                     if line.strip():
                         parts = line.split()
                         if len(parts) >= 4:
@@ -287,199 +288,33 @@ class MACChanger:
             print(f"{Fore.RED}Error listing interfaces: {e}{Style.RESET_ALL}")
             sys.exit(1)
 
-    def show_interface_details(self, interface):
-        """Display detailed information about a network interface."""
-        info = self.network_config.get_interface_info(interface)
-        if info:
-            print(f"\n{Fore.CYAN}Interface Details for {interface}:{Style.RESET_ALL}")
-            mac = self._get_current_mac(interface)
-            if mac:
-                print(f"{Fore.GREEN}MAC Address: {mac}{Style.RESET_ALL}")
-                vendor = self.lookup_vendor(mac)
-                print(f"{Fore.GREEN}Vendor: {vendor}{Style.RESET_ALL}")
-                
-                # Add permanent MAC display if available
-                perm_mac = self._get_permanent_mac(interface)
-                if perm_mac and perm_mac.lower() != mac.lower():
-                    print(f"{Fore.YELLOW}Permanent MAC: {perm_mac}{Style.RESET_ALL}")
-                    perm_vendor = self.lookup_vendor(perm_mac)
-                    print(f"{Fore.YELLOW}Permanent Vendor: {perm_vendor}{Style.RESET_ALL}")
-            
-            if info['ip_address']:
-                print(f"{Fore.YELLOW}IPv4 Address: {info['ip_address']}{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}Netmask: {info['netmask']}{Style.RESET_ALL}")
-            if info['ipv6_addresses']:
-                print(f"{Fore.YELLOW}IPv6 Addresses:{Style.RESET_ALL}")
-                for ipv6 in info['ipv6_addresses']:
-                    print(f"  {ipv6}")
-            if info['mtu']:
-                print(f"{Fore.YELLOW}MTU: {info['mtu']}{Style.RESET_ALL}")
-            if 'stats' in info:
-                print(f"\n{Fore.CYAN}Interface Statistics:{Style.RESET_ALL}")
-                print(f"{Fore.GREEN}RX Packets: {info['stats']['rx_packets']:,}{Style.RESET_ALL}")
-                print(f"{Fore.GREEN}RX Bytes: {info['stats']['rx_bytes']:,} bytes{Style.RESET_ALL}")
-                print(f"{Fore.GREEN}TX Packets: {info['stats']['tx_packets']:,}{Style.RESET_ALL}")
-                print(f"{Fore.GREEN}TX Bytes: {info['stats']['tx_bytes']:,} bytes{Style.RESET_ALL}")
-
     def _is_admin(self):
+        """Check if the script is running with administrator privileges."""
         try:
             return ctypes.windll.shell32.IsUserAnAdmin() if self.os_type == 'windows' else os.geteuid() == 0
         except:
             return False
 
-    def change_mac(self, interface, new_mac):
-        """Change MAC address of the specified interface."""
-        if not self._is_admin():
-            print(f"{Fore.RED}This operation requires administrator privileges!{Style.RESET_ALL}")
-            return False
-
-        try:
-            print(f"\n{Fore.CYAN}Changing MAC address for {interface}...{Style.RESET_ALL}")
-            old_mac = self._get_current_mac(interface)
-
-            # Check if running in a VM
-            is_vm = self._check_if_vm()
-            if is_vm:
-                print(f"{Fore.YELLOW}Virtual Machine detected. Some network adapters may not allow MAC address changes.{Style.RESET_ALL}")
-                print(f"{Fore.YELLOW}You may need to change the MAC address in your VM settings instead.{Style.RESET_ALL}")
-
-            # First bring down the interface
-            if self.os_type == 'windows':
-                try:
-                    # Stop the network adapter service
-                    subprocess.check_output(['net', 'stop', 'netadapter', '/y'], stderr=subprocess.PIPE, shell=True)
-                    
-                    # Disable the adapter
-                    subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=disable'], stderr=subprocess.PIPE)
-                    
-                    # Try multiple registry paths for VM adapters
-                    registry_paths = [
-                        "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4D36E972-E325-11CE-BFC1-08002BE10318}",
-                        "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Network"
-                    ]
-                    
-                    success = False
-                    for base_path in registry_paths:
-                        try:
-                            # Search for the network adapter in registry
-                            cmd = f'reg query "{base_path}" /s /f "{interface}" /d'
-                            output = subprocess.check_output(cmd, shell=True, stderr=subprocess.PIPE).decode()
-                            
-                            # Find the correct subkey
-                            for line in output.split('\n'):
-                                if interface.lower() in line.lower():
-                                    subkey = line.strip()
-                                    if "HKEY_LOCAL_MACHINE" in subkey:
-                                        # Try to set the MAC address
-                                        mac_cmd = f'reg add "{subkey}" /v NetworkAddress /t REG_SZ /d {new_mac.replace(":", "")} /f'
-                                        subprocess.check_output(mac_cmd, shell=True, stderr=subprocess.PIPE)
-                                        success = True
-                                        break
-                            
-                            if success:
-                                break
-                                
-                        except subprocess.CalledProcessError:
-                            continue
-                    
-                    if not success:
-                        print(f"{Fore.RED}Could not find network adapter in registry{Style.RESET_ALL}")
-                        return False
-                    
-                    # Start the network adapter service
-                    subprocess.check_output(['net', 'start', 'netadapter'], stderr=subprocess.PIPE, shell=True)
-                    
-                    # Enable the adapter
-                    subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=enable'], stderr=subprocess.PIPE)
-                    
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode() if e.stderr else str(e)
-                    print(f"{Fore.RED}Error changing MAC address: {error_msg}{Style.RESET_ALL}")
-                    return False
-            else:
-                try:
-                    # For Linux, try multiple methods
-                    methods = [
-                        ['ip', 'link', 'set', 'dev', interface, 'down'],
-                        ['ifconfig', interface, 'down'],
-                    ]
-                    
-                    # Try each method to bring down the interface
-                    for method in methods:
-                        try:
-                            subprocess.check_output(method, stderr=subprocess.PIPE)
-                            break
-                        except:
-                            continue
-                    
-                    # Try to change MAC using ip command first
-                    try:
-                        subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'address', new_mac], stderr=subprocess.PIPE)
-                    except:
-                        # If ip command fails, try macchanger
-                        try:
-                            subprocess.check_output(['macchanger', '--mac', new_mac, interface], stderr=subprocess.PIPE)
-                        except:
-                            print(f"{Fore.RED}Failed to change MAC address. Try installing macchanger: sudo apt-get install macchanger{Style.RESET_ALL}")
-                            return False
-                    
-                    # Try each method to bring up the interface
-                    for method in [['ip', 'link', 'set', 'dev', interface, 'up'], ['ifconfig', interface, 'up']]:
-                        try:
-                            subprocess.check_output(method, stderr=subprocess.PIPE)
-                            break
-                        except:
-                            continue
-                            
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr.decode() if e.stderr else str(e)
-                    print(f"{Fore.RED}Error changing MAC address: {error_msg}{Style.RESET_ALL}")
-                    return False
-            
-            print(f"{Fore.YELLOW}Waiting for interface to initialize...{Style.RESET_ALL}")
-            time.sleep(5)
-            
-            # Verify the change
-            current_mac = self._get_current_mac(interface)
-            if current_mac and current_mac.lower() == new_mac.lower():
-                print(f"{Fore.GREEN}Success! MAC address changed to: {current_mac}{Style.RESET_ALL}")
-                vendor = self.lookup_vendor(current_mac)
-                print(f"{Fore.CYAN}Vendor: {vendor}{Style.RESET_ALL}")
-                return True
-            else:
-                if is_vm:
-                    print(f"{Fore.RED}Failed to change MAC address. For virtual machines, try:{Style.RESET_ALL}")
-                    print(f"{Fore.YELLOW}1. Power off the VM{Style.RESET_ALL}")
-                    print(f"{Fore.YELLOW}2. Change MAC address in VM settings{Style.RESET_ALL}")
-                    print(f"{Fore.YELLOW}3. Power on the VM{Style.RESET_ALL}")
-                else:
-                    print(f"{Fore.RED}Failed to change MAC address{Style.RESET_ALL}")
-                if current_mac:
-                    print(f"{Fore.YELLOW}Current MAC: {current_mac}{Style.RESET_ALL}")
-                return False
-                
-        except Exception as e:
-            print(f"{Fore.RED}Unexpected error: {str(e)}{Style.RESET_ALL}")
-            return False
-
-    def _check_if_vm(self):
-        """Check if running in a virtual machine."""
-        try:
-            if self.os_type == 'windows':
-                # Check Windows system information
-                output = subprocess.check_output('systeminfo', shell=True).decode().lower()
-                vm_indicators = ['vmware', 'virtual', 'vbox', 'hyperv']
-                return any(indicator in output for indicator in vm_indicators)
-            else:
-                # Check Linux system information
-                with open('/proc/cpuinfo', 'r') as f:
-                    cpuinfo = f.read().lower()
-                vm_indicators = ['vmware', 'virtualbox', 'kvm', 'qemu']
-                return any(indicator in cpuinfo for indicator in vm_indicators)
-        except:
-            return False
+    def _log_mac_change(self, interface, old_mac, new_mac):
+        """Log MAC address changes to history file."""
+        history = []
+        if os.path.exists(self.history_file):
+            with open(self.history_file, 'r') as f:
+                history = json.load(f)
+        
+        history.append({
+            'interface': interface,
+            'old_mac': old_mac,
+            'new_mac': new_mac,
+            'timestamp': datetime.now().isoformat(),
+            'os': self.os_type
+        })
+        
+        with open(self.history_file, 'w') as f:
+            json.dump(history, f, indent=4)
 
     def lookup_vendor(self, mac_address):
+        """Look up the vendor of a MAC address."""
         try:
             oui = mac_address.replace(':', '')[:6]
             response = requests.get(f'https://api.macvendors.com/{oui}')
@@ -489,105 +324,240 @@ class MACChanger:
         except:
             return "Vendor lookup failed"
 
-    def run(self):
+    def change_mac(self, interface, new_mac):
+        """Change MAC address of the specified interface."""
+        if not self._is_admin():
+            print(f"{Fore.RED}This operation requires administrator privileges!{Style.RESET_ALL}")
+            sys.exit(1)
+
+        try:
+            print(f"\n{Fore.CYAN}Changing MAC address for {interface}...{Style.RESET_ALL}")
+            old_mac = self._get_current_mac(interface)
+            
+            if self.os_type == 'windows':
+                # Get registry path for the adapter
+                registry_path = self._get_adapter_registry_path(interface)
+                if not registry_path:
+                    print(f"{Fore.RED}Could not find registry path for interface {interface}{Style.RESET_ALL}")
+                    return
+
+                # Disable network adapter
+                subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=disable'])
+                
+                # Change MAC in registry
+                mac_value = new_mac.replace(':', '')
+                reg_cmd = f'reg add "{registry_path}" /v NetworkAddress /t REG_SZ /d "{mac_value}" /f'
+                subprocess.check_output(reg_cmd, shell=True)
+                
+                # Enable network adapter
+                subprocess.check_output(['netsh', 'interface', 'set', 'interface', interface, 'admin=enable'])
+            else:
+                subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'down'])
+                subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'address', new_mac])
+                subprocess.check_output(['ip', 'link', 'set', 'dev', interface, 'up'])
+            
+            # Wait for interface to come back up
+            print(f"{Fore.YELLOW}Waiting for interface to initialize...{Style.RESET_ALL}")
+            import time
+            time.sleep(5)
+            
+            # Verify the change
+            current_mac = self._get_current_mac(interface)
+            if current_mac and current_mac.lower() == new_mac.lower():
+                print(f"{Fore.GREEN}Success! MAC address changed to: {current_mac}{Style.RESET_ALL}")
+                vendor = self.lookup_vendor(current_mac)
+                print(f"{Fore.CYAN}Vendor: {vendor}{Style.RESET_ALL}")
+                self._log_mac_change(interface, old_mac, new_mac)
+            else:
+                print(f"{Fore.RED}Failed to change MAC address{Style.RESET_ALL}")
+                if current_mac:
+                    print(f"{Fore.YELLOW}Current MAC: {current_mac}{Style.RESET_ALL}")
+                
+        except subprocess.CalledProcessError as e:
+            print(f"{Fore.RED}Error changing MAC address: {e}{Style.RESET_ALL}")
+            sys.exit(1)
+
+    def show_history(self):
+        """Display MAC address change history."""
+        if not os.path.exists(self.history_file):
+            print(f"{Fore.YELLOW}No MAC address change history found.{Style.RESET_ALL}")
+            return
+        
+        with open(self.history_file, 'r') as f:
+            history = json.load(f)
+        
+        print(f"\n{Fore.CYAN}MAC Address Change History:{Style.RESET_ALL}")
+        for entry in history:
+            print(f"\n{Fore.GREEN}Timestamp: {entry['timestamp']}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Interface: {entry['interface']}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}Old MAC: {entry['old_mac']}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}New MAC: {entry['new_mac']}{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}OS: {entry['os']}{Style.RESET_ALL}")
+
+    def show_interface_details(self, interface):
+        """Display detailed information about a network interface."""
+        info = self.network_config.get_interface_info(interface)
+        if info:
+            print(f"\n{Fore.CYAN}Interface Details for {interface}:{Style.RESET_ALL}")
+            print(f"{Fore.GREEN}Status: {info['status']}{Style.RESET_ALL}")
+            if info['ip_address']:
+                print(f"{Fore.YELLOW}IPv4 Address: {info['ip_address']}{Style.RESET_ALL}")
+                print(f"{Fore.YELLOW}Netmask: {info['netmask']}{Style.RESET_ALL}")
+            if info['ipv6_addresses']:
+                print(f"{Fore.YELLOW}IPv6 Addresses:{Style.RESET_ALL}")
+                for ipv6 in info['ipv6_addresses']:
+                    print(f"  {ipv6}")
+            if info['mtu']:
+                print(f"{Fore.YELLOW}MTU: {info['mtu']}{Style.RESET_ALL}")
+            
+            if 'stats' in info:
+                print(f"\n{Fore.CYAN}Interface Statistics:{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}RX Packets: {info['stats']['rx_packets']}{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}RX Bytes: {info['stats']['rx_bytes']:,} bytes{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}TX Packets: {info['stats']['tx_packets']}{Style.RESET_ALL}")
+                print(f"{Fore.GREEN}TX Bytes: {info['stats']['tx_bytes']:,} bytes{Style.RESET_ALL}")
+
+    def configure_interface(self, interface):
+        """Configure network interface settings."""
+        while True:
+            print(f"\n{Fore.YELLOW}Network Configuration Options:{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}1. Change MAC Address{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}2. Set IP Address{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}3. Set MTU{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}4. Show Interface Details{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}5. Back to Main Menu{Style.RESET_ALL}")
+            
+            choice = input(f"\n{Fore.GREEN}Enter your choice (1-5): {Style.RESET_ALL}").strip()
+            
+            if choice == "1":
+                self._handle_mac_change(interface)
+            elif choice == "2":
+                self._handle_ip_change(interface)
+            elif choice == "3":
+                self._handle_mtu_change(interface)
+            elif choice == "4":
+                self.show_interface_details(interface)
+            elif choice == "5":
+                break
+            else:
+                print(f"{Fore.RED}Invalid choice{Style.RESET_ALL}")
+
+    def _handle_ip_change(self, interface):
+        """Handle IP address configuration."""
+        print(f"\n{Fore.CYAN}Current Configuration:{Style.RESET_ALL}")
+        self.show_interface_details(interface)
+        
+        ip = input(f"\n{Fore.YELLOW}Enter new IP address: {Style.RESET_ALL}").strip()
+        netmask = input(f"{Fore.YELLOW}Enter netmask (press Enter for default 255.255.255.0): {Style.RESET_ALL}").strip()
+        if not netmask:
+            netmask = "255.255.255.0"
+        
+        success, message = self.network_config.set_ip_address(interface, ip, netmask)
+        if success:
+            print(f"{Fore.GREEN}{message}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}{message}{Style.RESET_ALL}")
+
+    def _handle_mtu_change(self, interface):
+        """Handle MTU configuration."""
+        print(f"\n{Fore.CYAN}Current Configuration:{Style.RESET_ALL}")
+        self.show_interface_details(interface)
+        
+        try:
+            mtu = int(input(f"\n{Fore.YELLOW}Enter new MTU value (68-65535): {Style.RESET_ALL}"))
+            success, message = self.network_config.set_mtu(interface, mtu)
+            if success:
+                print(f"{Fore.GREEN}{message}{Style.RESET_ALL}")
+            else:
+                print(f"{Fore.RED}{message}{Style.RESET_ALL}")
+        except ValueError:
+            print(f"{Fore.RED}Invalid MTU value{Style.RESET_ALL}")
+
+    def _handle_mac_change(self, interface):
+        """Handle MAC address change."""
+        current_mac = self._get_current_mac(interface)
+        if current_mac:
+            print(f"\n{Fore.GREEN}Current MAC address: {current_mac}{Style.RESET_ALL}")
+            vendor = self.lookup_vendor(current_mac)
+            print(f"{Fore.CYAN}Current vendor: {vendor}{Style.RESET_ALL}")
+
+        print(f"\n{Fore.YELLOW}Choose an option:{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}1. Enter specific MAC address{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}2. Generate random MAC address{Style.RESET_ALL}")
+        choice = input(f"\n{Fore.GREEN}Enter your choice (1-2): {Style.RESET_ALL}").strip()
+
+        if choice == "1":
+            while True:
+                new_mac = input(f"{Fore.CYAN}Enter new MAC address (format xx:xx:xx:xx:xx:xx): {Style.RESET_ALL}").strip()
+                if self._validate_mac(new_mac):
+                    break
+                print(f"{Fore.RED}Invalid MAC address format. Please try again.{Style.RESET_ALL}")
+        elif choice == "2":
+            new_mac = self._get_random_mac()
+            print(f"{Fore.GREEN}Generated random MAC address: {new_mac}{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.RED}Invalid choice{Style.RESET_ALL}")
+            return
+
+        confirm = input(f"\n{Fore.YELLOW}Do you want to change the MAC address of {interface} to {new_mac}? (y/n): {Style.RESET_ALL}").strip().lower()
+        if confirm == 'y':
+            self.change_mac(interface, new_mac)
+
+    def run(self, args=None):
         """Run the Network Configuration Tool."""
         if not self._is_admin():
             print(f"{Fore.RED}Please run this script with administrator privileges!{Style.RESET_ALL}")
             sys.exit(1)
 
+        if args:
+            if args.show_history:
+                self.show_history()
+                return
+            
+            if args.interface and args.mac:
+                if not self._validate_mac(args.mac):
+                    print(f"{Fore.RED}Invalid MAC address format{Style.RESET_ALL}")
+                    return
+                self.change_mac(args.interface, args.mac)
+                return
+        
+        # Interactive mode
         while True:
-            try:
-                interfaces = self._list_interfaces()
-                if not interfaces:
-                    print(f"{Fore.RED}No network interfaces found!{Style.RESET_ALL}")
-                    sys.exit(1)
-                
-                print(f"\n{Fore.YELLOW}Choose an option:{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}1. Show Interface Details{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}2. Change MAC Address{Style.RESET_ALL}")
-                print(f"{Fore.CYAN}3. Exit{Style.RESET_ALL}")
-                
-                try:
-                    choice = input(f"\n{Fore.GREEN}Enter your choice (1-3): {Style.RESET_ALL}").strip()
-                    if choice not in ['1', '2', '3']:
-                        print(f"{Fore.RED}Invalid choice. Please enter a number between 1 and 3.{Style.RESET_ALL}")
-                        continue
-                    
-                    if choice == '3':
-                        print(f"{Fore.GREEN}Goodbye!{Style.RESET_ALL}")
+            interfaces = self._list_interfaces()
+            
+            print(f"\n{Fore.YELLOW}Choose an option:{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}1. Configure Interface{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}2. Show MAC Address History{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}3. Exit{Style.RESET_ALL}")
+            
+            choice = input(f"\n{Fore.GREEN}Enter your choice (1-3): {Style.RESET_ALL}").strip()
+            
+            if choice == "1":
+                while True:
+                    interface = input(f"\n{Fore.CYAN}Enter the interface name (e.g., 'Wi-Fi' or Ethernet): {Style.RESET_ALL}").strip()
+                    if interface in interfaces:
+                        self.configure_interface(interface)
                         break
-                    
-                    # Show available interfaces with numbers
-                    print(f"\n{Fore.CYAN}Available interfaces:{Style.RESET_ALL}")
-                    for idx, iface in enumerate(interfaces, 1):
-                        mac = self._get_current_mac(iface) or "Unknown MAC"
-                        print(f"{Fore.YELLOW}{idx}. {iface} - {mac}{Style.RESET_ALL}")
-                    
-                    # Allow selection by number or name
-                    iface_input = input(f"\n{Fore.CYAN}Enter interface number or name: {Style.RESET_ALL}").strip()
-                    try:
-                        idx = int(iface_input)
-                        if 1 <= idx <= len(interfaces):
-                            interface = interfaces[idx-1]
-                        else:
-                            print(f"{Fore.RED}Invalid interface number{Style.RESET_ALL}")
-                            continue
-                    except ValueError:
-                        interface = iface_input
-                        if interface not in interfaces:
-                            print(f"{Fore.RED}Invalid interface. Available interfaces: {', '.join(interfaces)}{Style.RESET_ALL}")
-                            continue
-
-                    if choice == '1':
-                        self.show_interface_details(interface)
-                    elif choice == '2':
-                        print(f"\n{Fore.YELLOW}MAC Address Options:{Style.RESET_ALL}")
-                        print(f"{Fore.CYAN}1. Enter specific MAC address{Style.RESET_ALL}")
-                        print(f"{Fore.CYAN}2. Generate random MAC address{Style.RESET_ALL}")
-                        print(f"{Fore.CYAN}3. Back to main menu{Style.RESET_ALL}")
-                        
-                        mac_choice = input(f"\n{Fore.GREEN}Enter your choice (1-3): {Style.RESET_ALL}").strip()
-                        
-                        if mac_choice == '1':
-                            while True:
-                                new_mac = input(f"{Fore.CYAN}Enter MAC address (format: xx:xx:xx:xx:xx:xx): {Style.RESET_ALL}").strip()
-                                if self._validate_mac(new_mac):
-                                    break
-                                print(f"{Fore.RED}Invalid MAC address format. Please use format xx:xx:xx:xx:xx:xx{Style.RESET_ALL}")
-                        elif mac_choice == '2':
-                            new_mac = self._get_random_mac()
-                            print(f"{Fore.GREEN}Generated random MAC address: {new_mac}{Style.RESET_ALL}")
-                        elif mac_choice == '3':
-                            continue
-                        else:
-                            print(f"{Fore.RED}Invalid choice{Style.RESET_ALL}")
-                            continue
-                        
-                        if mac_choice in ['1', '2']:
-                            # Show current MAC before changing
-                            current_mac = self._get_current_mac(interface)
-                            if current_mac:
-                                print(f"\n{Fore.YELLOW}Current MAC: {current_mac}{Style.RESET_ALL}")
-                            
-                            confirm = input(f"{Fore.YELLOW}Do you want to change to {new_mac}? (y/n): {Style.RESET_ALL}").strip().lower()
-                            if confirm == 'y':
-                                self.change_mac(interface, new_mac)
-                
-                except KeyboardInterrupt:
-                    print(f"\n{Fore.YELLOW}Operation cancelled by user{Style.RESET_ALL}")
-                    continue
-                except ValueError as e:
-                    print(f"{Fore.RED}Invalid input: {str(e)}{Style.RESET_ALL}")
-                    continue
-                
-            except Exception as e:
-                print(f"{Fore.RED}Unexpected error: {str(e)}{Style.RESET_ALL}")
-                sys.exit(1)
+                    print(f"{Fore.RED}Invalid interface. Please choose from the available interfaces.{Style.RESET_ALL}")
+            elif choice == "2":
+                self.show_history()
+            elif choice == "3":
+                print(f"{Fore.GREEN}Goodbye!{Style.RESET_ALL}")
+                break
+            else:
+                print(f"{Fore.RED}Invalid choice{Style.RESET_ALL}")
 
 def main():
+    parser = argparse.ArgumentParser(description='Network Configuration Tool')
+    parser.add_argument('-i', '--interface', help='Network interface to modify')
+    parser.add_argument('-m', '--mac', help='New MAC address')
+    parser.add_argument('--show-history', action='store_true', help='Show MAC address change history')
+    
+    args = parser.parse_args()
+    
     try:
         mac_changer = MACChanger()
-        mac_changer.run()
+        mac_changer.run(args)
     except KeyboardInterrupt:
         print(f"\n{Fore.RED}Operation cancelled by user{Style.RESET_ALL}")
         sys.exit(0)
